@@ -33,7 +33,7 @@ VOICE_HOTWORDS = {
         "box black box screwdriver handle pen toy"
     ),
     "zh": (
-        "Marvin 机械臂 抓取 夹取 递给我 笔 钢笔 螺丝刀 把手 "
+        "Marvin 机械臂 抓取 夹取 我想要 递给我 笔 钢笔 螺丝刀 把手 "
         "玩具 蓝色方块 黄色方块 方块 U盘 硬盘"
     ),
 }
@@ -227,7 +227,7 @@ class ParsedVoiceCommand:
 def requests_handover(text: str) -> bool:
     """Return whether a transcript explicitly asks for a handover."""
     command = re.sub(r"[\s，。！？、,!.?]", "", text).lower()
-    return "递给我" in command or any(
+    return any(phrase in command for phrase in ("我想要", "递给我")) or any(
         phrase in command for phrase in ("giveme", "handme", "bringme")
     )
 
@@ -244,7 +244,7 @@ def parse_voice_target(text: str) -> str | None:
         or not any(
             verb in command
             for verb in (
-                "夹", "抓", "拿", "取", "递给我",
+                "夹", "抓", "拿", "取", "我想要", "递给我",
                 "give", "hand", "bring", "pick", "grab", "take",
             )
         )
@@ -268,7 +268,7 @@ def parse_voice_target(text: str) -> str | None:
         return "yellow_cube"
     if "笔" in command or any(name in command for name in ("pen", "pencil")):
         return "pen"
-    if "玩具" in command or "white toy" in command:
+    if "玩具" in command or "whitetoy" in command:
         return "white toy"
     return None
 

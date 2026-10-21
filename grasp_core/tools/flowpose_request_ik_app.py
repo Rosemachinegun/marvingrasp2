@@ -1070,7 +1070,7 @@ class GraspDemoApp:
         )
         s.status = (
             f"Grip failed; stopping old motion, releasing {hand}, then moving "
-            f"from measured FK to recovery; {retry_text}"
+            f"from measured FK to HOME; {retry_text}"
         )
         print(f"[grip_retry] {s.status}", flush=True)
 
@@ -1099,7 +1099,7 @@ class GraspDemoApp:
             f"[grip_retry] {hand} released; waiting for settled measured FK",
             flush=True,
         )
-        return self.robot_actions.publish_failure_recovery(
+        return self.robot_actions.publish_home(
             hand,
             fresh_measured_start=True,
             resume_stop_generation=generation,

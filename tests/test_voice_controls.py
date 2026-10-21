@@ -97,19 +97,34 @@ def test_voice_handover_phrase_is_preserved_as_active_intent() -> None:
     assert voice.active_handover is False
 
 
-def test_chinese_toy_handover_is_recognized_and_uses_toy_prompt() -> None:
+@pytest.mark.parametrize("transcript", ("把玩具递给我", "我想要玩具"))
+def test_chinese_toy_handover_uses_only_white_toy_prompt(transcript: str) -> None:
     voice = VoiceGraspInput(language="zh")
     assert "玩具" in voice_hotwords("zh")
-    assert voice.submit_transcript("把玩具递给我") is True
+    assert "我想要" in voice_hotwords("zh")
+    assert requests_handover(transcript) is True
+    assert voice.submit_transcript(transcript) is True
 
     parsed = voice.poll()
 
     assert parsed is not None
-    assert parsed.target == "toy"
+    assert parsed.target == "white toy"
     assert parsed.handover is True
     voice.activate(parsed.target, handover=parsed.handover)
-    assert voice.sam_prompt("blue stuff,toy", {}) == "toy"
+    assert voice.sam_prompt("blue stuff,toy", {}) == "white toy"
     assert voice.active_handover is True
+
+
+def test_explicit_white_toy_request_uses_white_toy_prompt() -> None:
+    voice = VoiceGraspInput(language="en")
+    assert voice.submit_transcript("give me the white toy") is True
+
+    parsed = voice.poll()
+
+    assert parsed is not None
+    assert parsed.target == "white toy"
+    voice.activate(parsed.target, handover=parsed.handover)
+    assert voice.sam_prompt("toy,white toy", {}) == "white toy"
 
 
 @pytest.mark.parametrize(
