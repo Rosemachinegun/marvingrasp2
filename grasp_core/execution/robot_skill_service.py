@@ -58,13 +58,23 @@ class RobotActionService:
         targets: list[TargetObjectPose],
         *,
         retry: bool = False,
+        hand_override: str | None = None,
     ) -> RobotActionResult:
         selected_target = selected_ik_target(targets, self.args)
-        status = self.grasp.execute(
-            targets,
-            self.pick_templates,
-            retry=retry,
-        )
+        if hand_override is None:
+            status = self.grasp.execute(
+                targets,
+                self.pick_templates,
+                retry=retry,
+            )
+        else:
+            status = self.grasp.execute(
+                targets,
+                self.pick_templates,
+                retry=retry,
+                hand_override=hand_override,
+            )
+        effective_hand_mode = hand_override or str(self.args.ik_hand)
         assumed_success = (
             selected_target is not None
             and assume_grasp_success(selected_target.label)
@@ -76,12 +86,12 @@ class RobotActionService:
         return RobotActionResult(
             status=status,
             failed_min_limit=not assumed_success and non_contact_failure,
-            failed_hand=grip_failure_hand(status, str(self.args.ik_hand)),
+            failed_hand=grip_failure_hand(status, effective_hand_mode),
             grasp_confirmed=(assumed_success and accepted) or grip_confirmed(status),
             grasp_hand=(
                 grip_success_hand(status)
                 or (
-                    grip_failure_hand(status, str(self.args.ik_hand))
+                    grip_failure_hand(status, effective_hand_mode)
                     if assumed_success
                     else None
                 )
@@ -146,9 +156,10 @@ class RobotActionService:
         object_label: str | None = None,
         release_requested: Event,
         ready_event: Event,
+        fallback_requested: Event | None = None,
         timeout_prompt: Callable[[], object] | None = None,
     ) -> RobotActionResult:
-        """Wait for handover confirmation or run the timeout Place fallback."""
+        """Wait for B, or run fallback Place after X/timeout."""
         handover_hand = hand or ("left" if self.args.ik_hand == "left" else "right")
         result = execute_handover_after_grasp(
             self.ik_publisher,
@@ -157,6 +168,7 @@ class RobotActionService:
             grasp_confirmed=grasp_confirmed,
             release_requested=release_requested,
             ready_event=ready_event,
+            fallback_requested=fallback_requested,
             object_type=object_label,
             timeout_prompt=timeout_prompt,
         )
@@ -182,6 +194,17 @@ class RobotActionService:
     def publish_target_wait_point(self, hand: str) -> str:
         """Move one hand to the randomized target waiting point."""
         return self.home.move_to_target_wait_point(hand)
+
+    def publish_wave(self) -> str:
+        """Run the right-arm greeting through the serialized action service."""
+        if self.ik_publisher is None:
+            return "Wave unavailable: request_ik publisher is not initialized"
+
+        # Keep ROS-only message imports out of module import time so the
+        # planning/service layers remain usable in non-ROS unit tests.
+        from add.wave import execute_wave
+
+        return execute_wave(stop_requested=self.ik_publisher.stop_requested)
 
     def publish_failure_recovery(
         self, hand: str, *, fresh_measured_start: bool = False,

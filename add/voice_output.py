@@ -21,10 +21,14 @@ DEFAULT_VOICE_DIR = Path("/home/kewei/marvin_voice")
 WELCOME_SEQUENCE = ("01_greeting", "02_1_first_gift_question")
 TASK_FAILED_SEQUENCE = ("03_1_task_failed",)
 TASK_ACCEPTED_SEQUENCE = ("03_2_task_accepted",)
+RECOMMENDED_GIFT_FILE = Path(
+    "03_2_task_accepted/04_let_me_pick_a_gift_for_you.mp3"
+)
 REPLY_THANKS_SEQUENCE = ("05_1_reply_thanks",)
 NO_HANDOVER_SEQUENCE = ("05_2_no_handover",)
 GOODBYE_SEQUENCE = ("06_1_goodbye",)
 START_RECOGNITION = "start_recognition"
+START_RECOMMENDED_GIFT = "start_recommended_gift"
 PROMPT_ONLY = "prompt_only"
 
 
@@ -106,6 +110,14 @@ class VoiceOutput:
         """Acknowledge a valid recognized gift request."""
         return self.play_sequence(TASK_ACCEPTED_SEQUENCE)
 
+    def play_recommended_gift(self) -> str:
+        """Play the fixed E-key recommendation prompt before auto-picking."""
+        path = self.voice_dir / RECOMMENDED_GIFT_FILE
+        if not path.is_file():
+            return f"Voice prompt unavailable: file not found: {path}"
+        status, _request = self._queue_files((path,), START_RECOMMENDED_GIFT)
+        return status
+
     def play_task_failed(self) -> str:
         """Tell the user that speech or the requested gift was not found."""
         return self.play_sequence(TASK_FAILED_SEQUENCE)
@@ -146,6 +158,17 @@ class VoiceOutput:
             files = self._select_files(directories)
         except (OSError, RuntimeError) as exc:
             return f"Voice prompt unavailable: {exc}", None
+
+        return self._queue_files(files, purpose)
+
+    def _queue_files(
+        self,
+        files: tuple[Path, ...],
+        purpose: str,
+    ) -> tuple[str, _PlaybackRequest | None]:
+        """Queue already-resolved prompt files."""
+        if self._closed.is_set():
+            return "Voice prompt unavailable: player is closed", None
 
         was_running = self.running
         with self._state_lock:

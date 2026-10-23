@@ -4,6 +4,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 import add.web as web_module
@@ -22,6 +23,7 @@ from add.web import (
     format_base_link_targets,
 )
 from grasp_core.tools.flowpose_request_ik_app import GraspDemoApp, RuntimeState
+from grasp_core.core.types.robot_target_pose import TargetObjectPose
 
 
 class _VoiceInput:
@@ -97,11 +99,15 @@ def test_voice_handover_phrase_is_preserved_as_active_intent() -> None:
     assert voice.active_handover is False
 
 
-@pytest.mark.parametrize("transcript", ("把玩具递给我", "我想要玩具"))
+@pytest.mark.parametrize(
+    "transcript",
+    ("把玩具递给我", "我想要玩具", "给我推荐一个"),
+)
 def test_chinese_toy_handover_uses_only_white_toy_prompt(transcript: str) -> None:
     voice = VoiceGraspInput(language="zh")
     assert "玩具" in voice_hotwords("zh")
     assert "我想要" in voice_hotwords("zh")
+    assert "给我推荐一个" in voice_hotwords("zh")
     assert requests_handover(transcript) is True
     assert voice.submit_transcript(transcript) is True
 
@@ -125,6 +131,56 @@ def test_explicit_white_toy_request_uses_white_toy_prompt() -> None:
     assert parsed.target == "white toy"
     voice.activate(parsed.target, handover=parsed.handover)
     assert voice.sam_prompt("toy,white toy", {}) == "white toy"
+
+
+def _toy_target(label: str, *, camera_x: float, camera_z: float, base_y: float):
+    camera_pose = np.eye(4)
+    camera_pose[:3, 3] = [camera_x, 0.0, camera_z]
+    base_pose = np.eye(4)
+    base_pose[:3, 3] = [0.4, base_y, 0.7]
+    return TargetObjectPose(label, label, camera_pose, base_pose)
+
+
+def test_voice_toy_policy_keeps_only_rightmost_image_target() -> None:
+    left = _toy_target("white toy_0", camera_x=-0.1, camera_z=0.8, base_y=-0.2)
+    middle = _toy_target("white toy_1", camera_x=0.1, camera_z=0.5, base_y=-0.1)
+    right = _toy_target("white toy_2", camera_x=0.3, camera_z=1.0, base_y=0.2)
+    app = GraspDemoApp.__new__(GraspDemoApp)
+    app.state = RuntimeState(base_targets=[middle, right, left], status="FlowPose done")
+    app.voice_input = VoiceGraspInput()
+    app.voice_input.activate("white toy", handover=True)
+
+    app.apply_voice_target_policy()
+
+    # Image horizontal position follows x/z, so white toy_2 is rightmost.
+    assert app.state.base_targets == [right]
+    assert "selected rightmost toy: white toy_2" in app.state.status
+
+
+def test_every_voice_grasp_forces_right_hand() -> None:
+    # A positive base Y would normally select the left hand.
+    target = _toy_target("pen_0", camera_x=0.2, camera_z=0.8, base_y=0.2)
+    app = GraspDemoApp.__new__(GraspDemoApp)
+    app.args = SimpleNamespace(ik_target_index=0, ik_hand="auto")
+    app.state = RuntimeState(base_targets=[target])
+    app.voice_input = VoiceGraspInput()
+    app.voice_input.activate("pen", handover=True)
+    app.robot_actions = Mock()
+    app.action_executor = Mock()
+    app.action_executor.submit.return_value = Future()
+    app.grasp_future = None
+    app.place_future = None
+    app.ik_publisher = None
+    app.auto_home_future = None
+    app.auto_home_hand = None
+
+    app.publish_grasp()
+
+    app.action_executor.submit.assert_called_once_with(
+        app.robot_actions.publish_grasp,
+        [target],
+        hand_override="right",
+    )
 
 
 @pytest.mark.parametrize(
@@ -202,6 +258,7 @@ def test_voice_handover_uses_dedicated_action_and_clears_grasp_state() -> None:
         object_label="pen",
         release_requested=app.handover_release_requested,
         ready_event=app.handover_ready,
+        fallback_requested=app.handover_fallback_requested,
         timeout_prompt=app.voice_output.play_no_handover_and_wait,
     )
     future.set_result(SimpleNamespace(
@@ -240,6 +297,7 @@ def test_toy_handover_routes_to_handover_skill_service() -> None:
         object_label="toy",
         release_requested=app.handover_release_requested,
         ready_event=app.handover_ready,
+        fallback_requested=app.handover_fallback_requested,
     )
 
 
@@ -249,6 +307,7 @@ def test_b_confirms_release_only_after_handover_is_ready() -> None:
     app.place_handover_task = True
     app.handover_ready = Event()
     app.handover_release_requested = Event()
+    app.handover_fallback_requested = Event()
     app.manual_home_future = None
     app.voice_output = Mock()
 
@@ -265,6 +324,33 @@ def test_b_confirms_release_only_after_handover_is_ready() -> None:
     assert app.handle_key(ord("b"), None)
     app.voice_output.play_reply_thanks.assert_called_once_with()
     assert app.state.status == "Handover release already confirmed by B"
+
+
+def test_x_requests_immediate_handover_fallback_only_when_ready() -> None:
+    app = GraspDemoApp.__new__(GraspDemoApp)
+    app.state = RuntimeState()
+    app.place_handover_task = True
+    app.handover_ready = Event()
+    app.handover_release_requested = Event()
+    app.handover_fallback_requested = Event()
+    app.manual_home_future = None
+
+    assert app.handle_key(ord("x"), None)
+    assert app.handover_fallback_requested.is_set() is False
+    assert app.state.status == "Handover not ready: X fallback ignored"
+
+    app.handover_ready.set()
+    assert app.handle_key(ord("x"), None)
+    assert app.handover_fallback_requested.is_set() is True
+    assert app.handover_release_requested.is_set() is False
+    assert app.state.status == "Handover fallback requested by X"
+
+    assert app.handle_key(ord("b"), None)
+    assert app.handover_release_requested.is_set() is False
+    assert app.state.status == "Handover fallback requested by X: B ignored"
+
+    assert app.handle_key(ord("x"), None)
+    assert app.state.status == "Handover fallback already requested by X"
 
 
 def test_disabled_web_service_does_not_build_interface(monkeypatch) -> None:

@@ -67,7 +67,11 @@ from grasp_core.execution.skills.grasp import GRASP_PLANNER  # noqa: E402
 from grasp_core.planning.grasp.policies.ribbon import assume_grasp_success  # noqa: E402
 from grasp_core.planning.grasp.planner import UnifiedGraspPlanner  # noqa: E402
 from add.voice import VoiceGraspInput  # noqa: E402
-from add.voice_output import START_RECOGNITION, VoiceOutput  # noqa: E402
+from add.voice_output import (  # noqa: E402
+    START_RECOGNITION,
+    START_RECOMMENDED_GIFT,
+    VoiceOutput,
+)
 from add.web import (  # noqa: E402
     TabletCommand,
     TabletTaskLoopBridge,
@@ -87,6 +91,9 @@ KEY_HOME = ord("h")
 KEY_GRIP = ord("l")
 KEY_RELEASE = ord("p")
 KEY_VOICE = ord("v")
+KEY_RECOMMEND_GIFT = ord("e")
+KEY_WAVE = ord("w")
+KEY_HANDOVER_FALLBACK = ord("x")
 KEY_PAUSE = ord("s")
 
 DASHBOARD_WINDOW = "RealSense + SAM3 + FlowPose"
@@ -184,10 +191,13 @@ class GraspDemoApp:
         self.place_handover_task = False
         self.handover_ready = Event()
         self.handover_release_requested = Event()
+        self.handover_fallback_requested = Event()
         self.manual_home_future: Future | None = None
         self.manual_home_hand: tuple[str, ...] | None = None
         self.auto_home_future: Future | None = None
         self.auto_home_hand: str | None = None
+        self.wave_future: Future | None = None
+        self.wave_recovery_required = False
         self.gripper_interrupted = False
 
         sam_kwargs, flowpose_kwargs, capture_dir = build_runner_kwargs(args)
@@ -432,6 +442,9 @@ class GraspDemoApp:
         *,
         followup: bool = True,
     ) -> None:
+        if is_pending(getattr(self, "wave_future", None)):
+            self.state.status = "Gripper command ignored: wave action is running"
+            return
         if self.gripper_future is not None and not self.gripper_future.done():
             self.state.status = "Gripper command already running"
             return
@@ -578,8 +591,37 @@ class GraspDemoApp:
                 self.args,
             )
             if s.flowpose_future.done():
+                self.apply_voice_target_policy()
                 self.publish_target_visualization(s.base_targets)
                 s.flowpose_future = None
+
+    def apply_voice_target_policy(self) -> None:
+        """Apply target selection rules owned by the active voice request."""
+        active_target = getattr(
+            getattr(self, "voice_input", None), "active_target", None
+        )
+        if active_target != "white toy":
+            return
+        targets = self.state.base_targets
+        if len(targets) <= 1:
+            return
+
+        def image_horizontal_coordinate(target: TargetObjectPose) -> float:
+            pose = np.asarray(target.camera_pose, dtype=np.float64)
+            if pose.shape != (4, 4):
+                return float("-inf")
+            x, z = float(pose[0, 3]), float(pose[2, 3])
+            # Perspective projection is u = fx * x/z + cx.  Since fx is
+            # positive, the largest x/z is the rightmost target in the image.
+            return x / z if z > 1e-8 else float("-inf")
+
+        selected = max(targets, key=image_horizontal_coordinate)
+        self.state.base_targets = [selected]
+        self.state.status += f" | voice selected rightmost toy: {selected.label}"
+        print(
+            f"[voice] selected rightmost toy {selected.label!r}; forcing right hand",
+            flush=True,
+        )
 
     def publish_target_visualization(
         self,
@@ -618,11 +660,20 @@ class GraspDemoApp:
         if is_pending(self.place_future):
             self.state.status = "Grasp waiting for place action"
             return
+        if is_pending(getattr(self, "wave_future", None)):
+            self.state.status = "Grasp waiting for wave action"
+            return
         if self.ik_publisher is not None:
             self.ik_publisher.clear_stop()
 
         targets = list(self.state.base_targets)
-        next_hand = self._selected_target_hand(targets)
+        # Voice-triggered grasps are right-hand-only.  This is independent of
+        # the target's base-frame side and remains in force for retries.
+        active_voice_target = getattr(
+            getattr(self, "voice_input", None), "active_target", None
+        )
+        hand_override = "right" if active_voice_target is not None else None
+        next_hand = hand_override or self._selected_target_hand(targets)
         parked_hand = self.state.parked_after_place_hand
         switched_from_hand: str | None = None
 
@@ -648,17 +699,32 @@ class GraspDemoApp:
         else:
             self.state.parked_after_place_hand = None
         if retry:
-            self.grasp_future = self.action_executor.submit(
-                self.robot_actions.publish_grasp,
-                targets,
-                retry=True,
-            )
+            if hand_override is None:
+                self.grasp_future = self.action_executor.submit(
+                    self.robot_actions.publish_grasp,
+                    targets,
+                    retry=True,
+                )
+            else:
+                self.grasp_future = self.action_executor.submit(
+                    self.robot_actions.publish_grasp,
+                    targets,
+                    retry=True,
+                    hand_override=hand_override,
+                )
             action_status = "Grasp retry action running"
         else:
-            self.grasp_future = self.action_executor.submit(
-                self.robot_actions.publish_grasp,
-                targets,
-            )
+            if hand_override is None:
+                self.grasp_future = self.action_executor.submit(
+                    self.robot_actions.publish_grasp,
+                    targets,
+                )
+            else:
+                self.grasp_future = self.action_executor.submit(
+                    self.robot_actions.publish_grasp,
+                    targets,
+                    hand_override=hand_override,
+                )
             action_status = "Grasp action running"
         if switched_from_hand is not None:
             self.state.status = (
@@ -784,8 +850,11 @@ class GraspDemoApp:
             self.handover_ready = Event()
         if not hasattr(self, "handover_release_requested"):
             self.handover_release_requested = Event()
+        if not hasattr(self, "handover_fallback_requested"):
+            self.handover_fallback_requested = Event()
         self.handover_ready.clear()
         self.handover_release_requested.clear()
+        self.handover_fallback_requested.clear()
         # A voice command owns one pick/place cycle, even when perception
         # finds several matching objects. A count of one makes Place return
         # the executing hand HOME instead of parking for the next target.
@@ -809,6 +878,7 @@ class GraspDemoApp:
                 object_label=object_label,
                 release_requested=self.handover_release_requested,
                 ready_event=self.handover_ready,
+                fallback_requested=self.handover_fallback_requested,
             )
             if callable(timeout_prompt):
                 handover_kwargs["timeout_prompt"] = timeout_prompt
@@ -842,6 +912,7 @@ class GraspDemoApp:
             self.place_handover_task = False
             self.handover_ready.clear()
             self.handover_release_requested.clear()
+            self.handover_fallback_requested.clear()
             return
         target_count = self.place_target_count
         voice_task = self.place_voice_task
@@ -852,6 +923,7 @@ class GraspDemoApp:
         self.place_handover_task = False
         self.handover_ready.clear()
         self.handover_release_requested.clear()
+        self.handover_fallback_requested.clear()
         self.state.status = result.status
         if "GRASP_DROPPED" in result.status:
             self.start_drop_recovery(result.status, result.grasp_hand)
@@ -889,8 +961,11 @@ class GraspDemoApp:
             self.place_handover_task
             and self.handover_ready.is_set()
             and not self.handover_release_requested.is_set()
+            and not self.handover_fallback_requested.is_set()
         ):
-            self.state.status = "Handover ready: press B to release and return HOME"
+            self.state.status = (
+                "Handover ready: press B to release, or X for fallback Place"
+            )
 
     def publish_place(self) -> None:
         """Backward-compatible entry point for scheduling Place."""
@@ -947,6 +1022,7 @@ class GraspDemoApp:
         # actions before releasing, measuring, or permitting HOME publication.
         previous_actions = tuple(f for f in (
             self.grasp_future, self.manual_home_future, self.gripper_future,
+            getattr(self, "wave_future", None),
             *s.recovery_futures,
         ) if f is not None)
         s.drop_recovery_futures = [
@@ -1050,6 +1126,7 @@ class GraspDemoApp:
                 getattr(self, "place_future", None),
                 getattr(self, "manual_home_future", None),
                 getattr(self, "gripper_future", None),
+                getattr(self, "wave_future", None),
             )
             if future is not None
         )
@@ -1222,6 +1299,7 @@ class GraspDemoApp:
             or is_pending(s.flowpose_future)
             or is_pending(self.place_future)
             or is_pending(self.manual_home_future)
+            or is_pending(getattr(self, "wave_future", None))
             or s.retry_stage is not RetryStage.IDLE
             or bool(s.recovery_futures)
         ):
@@ -1345,7 +1423,9 @@ class GraspDemoApp:
     def publish_manual_home(self, hands: tuple[str, ...] = ("left", "right")) -> None:
         if (self.grasp_future is not None or self.place_future is not None
                 or self.gripper_future is not None
-                or self.manual_home_future is not None or self.state.recovery_futures
+                or self.manual_home_future is not None
+                or is_pending(getattr(self, "wave_future", None))
+                or self.state.recovery_futures
                 or self.state.drop_recovery_futures
                 or self.state.pipeline_stage is not PipelineStage.IDLE):
             self.state.status = "HOME deferred: another robot action is still running"
@@ -1395,10 +1475,52 @@ class GraspDemoApp:
                 is_pending(self.place_future),
                 is_pending(self.manual_home_future),
                 is_pending(self.auto_home_future),
+                is_pending(getattr(self, "wave_future", None)),
                 is_pending(self.state.sam_future),
                 is_pending(self.state.flowpose_future),
             )
         )
+
+    def publish_wave(self) -> None:
+        """Queue one greeting gesture without competing with other robot work."""
+        if self.robot_actions is None:
+            self.state.status = "Wave unavailable: robot action service is not ready"
+            return
+        if (
+            self.robot_busy()
+            or is_pending(self.gripper_future)
+            or bool(self.state.recovery_futures)
+            or bool(self.state.drop_recovery_futures)
+            or self.state.pipeline_stage is not PipelineStage.IDLE
+        ):
+            self.state.status = "Wave ignored: another task is running"
+            return
+        if self.ik_publisher is not None:
+            self.ik_publisher.clear_stop()
+        self.wave_recovery_required = False
+        self.wave_future = self.action_executor.submit(
+            self.robot_actions.publish_wave,
+        )
+        self.state.status = "Right-arm wave running"
+
+    def collect_wave_result(self) -> None:
+        """Consume a completed W-key gesture on the application thread."""
+        future = getattr(self, "wave_future", None)
+        if future is None or not future.done():
+            return
+        try:
+            status = future.result()
+        except Exception as exc:  # noqa: BLE001
+            status = f"Wave failed: {exc}"
+            self.wave_recovery_required = bool(
+                getattr(exc, "manual_recovery_required", False)
+            )
+            print(f"[wave] {status}", flush=True)
+        self.wave_future = None
+        if self.state.paused:
+            self.state.status = f"Paused by S; {status}"
+        else:
+            self.state.status = status
 
     def request_voice(self) -> None:
         """Play the welcome prompts, then start one-shot speech recognition."""
@@ -1417,6 +1539,22 @@ class GraspDemoApp:
         if status:
             self.state.status = status
 
+    def request_recommended_gift(self) -> None:
+        """Play the E-key prompt before starting the toy handover workflow."""
+        voice_output = getattr(self, "voice_output", None)
+        if voice_output is None:
+            self.state.status = "Recommended gift unavailable: no voice output"
+            return
+        if (
+            self.robot_busy()
+            or self.voice_input.task_active
+            or self.voice_input.recognition_running
+            or voice_output.running
+        ):
+            self.state.status = "Recommended gift ignored: robot or voice is busy"
+            return
+        self.state.status = voice_output.play_recommended_gift()
+
     def collect_voice_output(self) -> None:
         """Start STT only after Marvin's complete prompt sequence finishes."""
         voice_output = getattr(self, "voice_output", None)
@@ -1427,6 +1565,17 @@ class GraspDemoApp:
             return
         if not result.succeeded:
             self.state.status = f"Voice prompt failed: {result.error}"
+            return
+        if result.purpose == START_RECOMMENDED_GIFT:
+            if bool(getattr(self.state, "paused", False)):
+                self.state.status = "Recommended gift cancelled: application paused"
+                return
+            if self.robot_busy() or self.voice_input.task_active:
+                self.state.status = "Recommended gift cancelled: robot busy"
+                return
+            self.voice_input.activate("white toy", handover=True)
+            if not self.start_pipeline(grasp_on_done=True):
+                self.fail_voice_task()
             return
         if result.purpose != START_RECOGNITION:
             return
@@ -1527,10 +1676,21 @@ class GraspDemoApp:
                     self.ik_publisher.request_stop()
                 self.state.status = "Paused by S: drop HOME cancellation requested"
                 return True
+            if (self.state.paused
+                    and getattr(self, "wave_future", None) is not None
+                    and self.wave_future.done()):
+                self.collect_wave_result()
+            if (self.state.paused
+                    and bool(getattr(self, "wave_recovery_required", False))):
+                self.state.status = (
+                    "Paused: wave stopped away from HOME; manual recovery required"
+                )
+                return True
             if self.state.paused and (
                 is_pending(self.grasp_future)
                 or is_pending(self.place_future)
                 or is_pending(self.manual_home_future)
+                or is_pending(getattr(self, "wave_future", None))
                 or any(is_pending(f) for f in self.state.recovery_futures)
                 or any(is_pending(f) for f in self.state.drop_recovery_futures)
             ):
@@ -1555,6 +1715,7 @@ class GraspDemoApp:
                 # it must not be interpreted as a fresh successful grasp.
                 self.collect_grasp_result()
                 self.collect_manual_home_result()
+                self.collect_wave_result()
                 if self.ik_publisher is not None:
                     self.ik_publisher.clear_stop()
                 self.state.status = "Resumed by S"
@@ -1569,7 +1730,9 @@ class GraspDemoApp:
         if key == KEY_FLOWPOSE and bool(
             getattr(self, "place_handover_task", False)
         ):
-            if self.handover_release_requested.is_set():
+            if self.handover_fallback_requested.is_set():
+                self.state.status = "Handover fallback requested by X: B ignored"
+            elif self.handover_release_requested.is_set():
                 self.state.status = "Handover release already confirmed by B"
             elif self.handover_ready.is_set():
                 voice_output = getattr(self, "voice_output", None)
@@ -1579,6 +1742,20 @@ class GraspDemoApp:
                 self.state.status = "Handover release confirmed by B"
             else:
                 self.state.status = "Handover not ready: B release ignored"
+            return True
+
+        if key == KEY_HANDOVER_FALLBACK and bool(
+            getattr(self, "place_handover_task", False)
+        ):
+            if self.handover_release_requested.is_set():
+                self.state.status = "Handover already confirmed by B: X ignored"
+            elif self.handover_fallback_requested.is_set():
+                self.state.status = "Handover fallback already requested by X"
+            elif self.handover_ready.is_set():
+                self.handover_fallback_requested.set()
+                self.state.status = "Handover fallback requested by X"
+            else:
+                self.state.status = "Handover not ready: X fallback ignored"
             return True
 
         if key == KEY_CAPTURE:
@@ -1608,6 +1785,10 @@ class GraspDemoApp:
             self.send_gripper("release", followup=False)
         elif key == KEY_VOICE:
             self.request_voice()
+        elif key == KEY_RECOMMEND_GIFT:
+            self.request_recommended_gift()
+        elif key == KEY_WAVE:
+            self.publish_wave()
 
         return True
 
@@ -1638,6 +1819,7 @@ class GraspDemoApp:
             self.update_handover_status()
             self.collect_auto_home_result()
             self.collect_manual_home_result()
+            self.collect_wave_result()
             self._collect_gripper_result()
             self.update_drop_recovery()
             if not self.state.paused:

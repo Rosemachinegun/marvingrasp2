@@ -33,7 +33,7 @@ VOICE_HOTWORDS = {
         "box black box screwdriver handle pen toy"
     ),
     "zh": (
-        "Marvin 机械臂 抓取 夹取 我想要 递给我 笔 钢笔 螺丝刀 把手 "
+        "Marvin 机械臂 抓取 夹取 我想要 递给我 给我推荐一个 推荐 笔 钢笔 螺丝刀 把手 "
         "玩具 蓝色方块 黄色方块 方块 U盘 硬盘"
     ),
 }
@@ -227,7 +227,9 @@ class ParsedVoiceCommand:
 def requests_handover(text: str) -> bool:
     """Return whether a transcript explicitly asks for a handover."""
     command = re.sub(r"[\s，。！？、,!.?]", "", text).lower()
-    return any(phrase in command for phrase in ("我想要", "递给我")) or any(
+    return any(
+        phrase in command for phrase in ("我想要", "递给我", "给我推荐一个")
+    ) or any(
         phrase in command for phrase in ("giveme", "handme", "bringme")
     )
 
@@ -235,6 +237,7 @@ def requests_handover(text: str) -> bool:
 def parse_voice_target(text: str) -> str | None:
     """Map a short English or Chinese grasp instruction to an object label."""
     command = re.sub(r"[\s，。！？、,!.?]", "", text).lower()
+    recommendation = "给我推荐一个" in command
     if (
         not command
         or any(
@@ -244,12 +247,17 @@ def parse_voice_target(text: str) -> str | None:
         or not any(
             verb in command
             for verb in (
-                "夹", "抓", "拿", "取", "我想要", "递给我",
+                "夹", "抓", "拿", "取", "我想要", "递给我", "推荐",
                 "give", "hand", "bring", "pick", "grab", "take",
             )
         )
     ):
         return None
+
+    # A recommendation is deliberately deterministic: use the same toy
+    # prompt and downstream handover policy as “把玩具递给我”.
+    if recommendation:
+        return "white toy"
 
     # Check box phrases before "pen": "pencil case" contains "pen".
     if any(name in command for name in ("pencilcase", "pencilbox", "blackbox", "box")):

@@ -5,7 +5,9 @@ from unittest.mock import Mock
 
 from add.voice_output import (
     PROMPT_ONLY,
+    RECOMMENDED_GIFT_FILE,
     START_RECOGNITION,
+    START_RECOMMENDED_GIFT,
     VoiceOutput,
     VoicePlaybackResult,
 )
@@ -36,6 +38,28 @@ def test_welcome_selects_greeting_then_first_question(tmp_path: Path) -> None:
         greeting / "01_hello.mp3",
         question / "01_question.mp3",
     )
+
+
+def test_recommended_gift_plays_the_exact_configured_file(tmp_path: Path) -> None:
+    prompt = tmp_path / RECOMMENDED_GIFT_FILE
+    prompt.parent.mkdir()
+    prompt.touch()
+    output = VoiceOutput(tmp_path, player="/bin/true")
+    try:
+        status = output.play_recommended_gift()
+        result = None
+        deadline = time.monotonic() + 1.0
+        while result is None and time.monotonic() < deadline:
+            result = output.poll()
+            if result is None:
+                time.sleep(0.01)
+    finally:
+        output.close()
+
+    assert "03_2_task_accepted" in status
+    assert result is not None
+    assert result.files == (prompt,)
+    assert result.purpose == START_RECOMMENDED_GIFT
 
 
 class _VoiceOutput:
@@ -106,6 +130,35 @@ def test_recognition_starts_after_prompt_sequence_completes() -> None:
 
     assert app.voice_input.request_calls == 1
     assert app.state.status == "recognition started"
+
+
+def test_e_key_prompt_then_starts_rightmost_toy_handover_workflow() -> None:
+    result = VoicePlaybackResult(
+        files=(Path("04_let_me_pick_a_gift_for_you.mp3"),),
+        purpose=START_RECOMMENDED_GIFT,
+    )
+    app = GraspDemoApp.__new__(GraspDemoApp)
+    app.state = RuntimeState()
+    app.manual_home_future = None
+    app.voice_input = Mock()
+    app.voice_input.task_active = False
+    app.voice_input.recognition_running = False
+    app.voice_output = Mock()
+    app.voice_output.running = False
+    app.voice_output.play_recommended_gift.return_value = "recommendation playing"
+    app.voice_output.poll.return_value = result
+    app.robot_busy = Mock(return_value=False)
+    app.start_pipeline = Mock(return_value=True)
+
+    assert app.handle_key(ord("e"), None)
+    assert app.state.status == "recommendation playing"
+    app.start_pipeline.assert_not_called()
+
+    app.collect_voice_output()
+
+    app.voice_input.activate.assert_called_once_with("white toy", handover=True)
+    app.start_pipeline.assert_called_once_with(grasp_on_done=True)
+    app.voice_output.play_task_accepted.assert_not_called()
 
 
 def test_recognition_does_not_start_if_app_is_paused_during_prompt() -> None:

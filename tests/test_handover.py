@@ -128,3 +128,45 @@ def test_handover_timeout_plays_prompt_then_uses_fixed_place(monkeypatch) -> Non
         object_type="toy",
         target_count=1,
     )
+
+
+def test_x_request_enters_handover_fallback_without_waiting_for_timeout(
+    monkeypatch,
+) -> None:
+    publisher = Mock()
+    start_pose = (np.array([0.4, -0.2, 0.7]), (0.0, 0.0, 0.0, 1.0))
+    timeout_prompt = Mock()
+    fallback_place = Mock(return_value=FixedPlaceResult(True, "place; HOME"))
+    release = Mock()
+    monkeypatch.setattr(
+        handover_module, "read_current_tool_pose", Mock(return_value=start_pose)
+    )
+    monkeypatch.setattr(
+        handover_module, "publisher_stop_requested", Mock(return_value=False)
+    )
+    monkeypatch.setattr(handover_module, "publish_path", Mock(return_value=12))
+    monkeypatch.setattr(handover_module, "send_gripper_signal", release)
+    monkeypatch.setattr(
+        handover_module, "execute_fixed_place_after_grasp", fallback_place
+    )
+    monkeypatch.setattr(handover_module, "HANDOVER_CONFIRM_POLL_SEC", 0.0)
+    fallback_requested = Event()
+    fallback_requested.set()
+
+    result = execute_handover_after_grasp(
+        publisher,
+        "right",
+        Namespace(),
+        grasp_confirmed=True,
+        release_requested=Event(),
+        ready_event=Event(),
+        fallback_requested=fallback_requested,
+        object_type="toy",
+        timeout_prompt=timeout_prompt,
+    )
+
+    assert result.ok is True
+    assert "requested by X" in result.status
+    timeout_prompt.assert_called_once_with()
+    release.assert_not_called()
+    fallback_place.assert_called_once()

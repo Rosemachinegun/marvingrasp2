@@ -59,10 +59,11 @@ def execute_handover_after_grasp(
     grasp_confirmed: bool,
     release_requested: Event,
     ready_event: Event,
+    fallback_requested: Event | None = None,
     object_type: str | None = None,
     timeout_prompt: Callable[[], object] | None = None,
 ) -> SkillResult:
-    """Move to handover, or fall back to fixed Place after a B-key timeout."""
+    """Move to handover; B releases, while X or timeout runs fallback Place."""
     hand = normalize_hand(hand)
     if not bool(grasp_confirmed):
         status = f"{hand} handover blocked: grasp is not confirmed"
@@ -103,18 +104,27 @@ def execute_handover_after_grasp(
 
     ready_event.set()
     print(
-        f"[handover] {hand} reached handover pose; press B to release",
+        f"[handover] {hand} reached handover pose; "
+        "press B to release or X for fallback Place",
         flush=True,
     )
     confirm_deadline = time.monotonic() + HANDOVER_CONFIRM_TIMEOUT_SEC
     while not release_requested.wait(timeout=HANDOVER_CONFIRM_POLL_SEC):
         if publisher_stop_requested(publisher):
             return SkillResult(False, f"STOPPED while {hand} awaited B release")
-        if time.monotonic() >= confirm_deadline:
+        forced_fallback = (
+            fallback_requested is not None and fallback_requested.is_set()
+        )
+        if forced_fallback or time.monotonic() >= confirm_deadline:
             ready_event.clear()
+            fallback_reason = (
+                "requested by X"
+                if forced_fallback
+                else f"timed out after {HANDOVER_CONFIRM_TIMEOUT_SEC:g}s"
+            )
             print(
-                f"[handover] no B confirmation within "
-                f"{HANDOVER_CONFIRM_TIMEOUT_SEC:g}s; playing no-handover prompt",
+                f"[handover] fallback {fallback_reason}; "
+                "playing no-handover prompt",
                 flush=True,
             )
             if timeout_prompt is not None:
@@ -131,8 +141,7 @@ def execute_handover_after_grasp(
             )
             return SkillResult(
                 place_result.ok,
-                f"{hand} handover timed out after "
-                f"{HANDOVER_CONFIRM_TIMEOUT_SEC:g}s; fallback Place: "
+                f"{hand} handover {fallback_reason}; fallback Place: "
                 f"{place_result.status}",
             )
 

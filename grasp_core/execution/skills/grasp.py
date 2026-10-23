@@ -150,6 +150,7 @@ def execute_grasp(
     args: argparse.Namespace,
     *,
     retry: bool = False,
+    hand_override: str | None = None,
 ) -> str:
     if publisher is None:
         status = request_ik_publisher_unavailable_status(args)
@@ -162,7 +163,8 @@ def execute_grasp(
 
     index = min(max(int(args.ik_target_index), 0), len(targets) - 1)
     target = targets[index]
-    hand = select_ik_hand(target.base_xyz, args.ik_hand)
+    hand_mode = hand_override or args.ik_hand
+    hand = select_ik_hand(target.base_xyz, hand_mode)
     planner = GRASP_PLANNER
     if retry:
         target = _apply_retry_x_jitter(target, planner.config.retry_x_jitter_m)
@@ -449,7 +451,17 @@ class GraspSkill(SkillRuntime):
         pick_templates: dict[str, dict[str, list[PickTemplateWaypoint]]],
         *,
         retry: bool = False,
+        hand_override: str | None = None,
     ) -> str:
+        if retry and hand_override is not None:
+            return self._executor(
+                self.publisher,
+                targets,
+                pick_templates,
+                self.args,
+                retry=retry,
+                hand_override=hand_override,
+            )
         if retry:
             return self._executor(
                 self.publisher,
@@ -457,5 +469,13 @@ class GraspSkill(SkillRuntime):
                 pick_templates,
                 self.args,
                 retry=True,
+            )
+        if hand_override is not None:
+            return self._executor(
+                self.publisher,
+                targets,
+                pick_templates,
+                self.args,
+                hand_override=hand_override,
             )
         return self._executor(self.publisher, targets, pick_templates, self.args)

@@ -57,7 +57,7 @@ def make_dashboard(
     place_text = "auto place on" if place_enabled else "auto place off"
     text = (
         f"A:auto grasp | Z:SAM3+FlowPose | B:FlowPose | C:target | S:pause | "
-        f"H:both home | L/P:grip/release | "
+        f"H:both home | W:wave | L/P:grip/release | "
         f"{place_text} | Q/Esc: quit | "
         f"SAM3 pending={sam_pending} FlowPose pending={flowpose_pending} | {status}"
     )
