@@ -19,6 +19,7 @@ from typing import Sequence
 
 DEFAULT_VOICE_DIR = Path("/home/kewei/marvin_voice")
 WELCOME_SEQUENCE = ("01_greeting", "02_1_first_gift_question")
+REPEAT_QUESTION_SEQUENCE = ("02_2_repeat_question",)
 TASK_FAILED_SEQUENCE = ("03_1_task_failed",)
 TASK_ACCEPTED_SEQUENCE = ("03_2_task_accepted",)
 RECOMMENDED_GIFT_FILE = Path(
@@ -28,6 +29,7 @@ REPLY_THANKS_SEQUENCE = ("05_1_reply_thanks",)
 NO_HANDOVER_SEQUENCE = ("05_2_no_handover",)
 GOODBYE_SEQUENCE = ("06_1_goodbye",)
 START_RECOGNITION = "start_recognition"
+START_RETRY_RECOGNITION = "start_retry_recognition"
 START_RECOMMENDED_GIFT = "start_recommended_gift"
 PROMPT_ONLY = "prompt_only"
 
@@ -109,6 +111,13 @@ class VoiceOutput:
     def play_task_accepted(self) -> str:
         """Acknowledge a valid recognized gift request."""
         return self.play_sequence(TASK_ACCEPTED_SEQUENCE)
+
+    def play_repeat_question(self) -> str:
+        """Ask for the gift again before a shorter second recording."""
+        return self.play_sequence(
+            REPEAT_QUESTION_SEQUENCE,
+            purpose=START_RETRY_RECOGNITION,
+        )
 
     def play_recommended_gift(self) -> str:
         """Play the fixed E-key recommendation prompt before auto-picking."""

@@ -70,6 +70,7 @@ from add.voice import VoiceGraspInput  # noqa: E402
 from add.voice_output import (  # noqa: E402
     START_RECOGNITION,
     START_RECOMMENDED_GIFT,
+    START_RETRY_RECOGNITION,
     VoiceOutput,
 )
 from add.web import (  # noqa: E402
@@ -198,6 +199,13 @@ class GraspDemoApp:
         self.auto_home_hand: str | None = None
         self.wave_future: Future | None = None
         self.wave_recovery_required = False
+        # V starts welcome playback and the wave concurrently.  The mic opens
+        # as soon as the welcome finishes; a recognized command remains queued
+        # until the wave has safely returned HOME.
+        self.voice_intro_active = False
+        self.voice_intro_prompt_done = False
+        self.voice_intro_wave_done = False
+        self.voice_recognition_attempt = 0
         self.gripper_interrupted = False
 
         sam_kwargs, flowpose_kwargs, capture_dir = build_runner_kwargs(args)
@@ -600,7 +608,7 @@ class GraspDemoApp:
         active_target = getattr(
             getattr(self, "voice_input", None), "active_target", None
         )
-        if active_target != "white toy":
+        if active_target not in {"white toy", "black box"}:
             return
         targets = self.state.base_targets
         if len(targets) <= 1:
@@ -617,9 +625,12 @@ class GraspDemoApp:
 
         selected = max(targets, key=image_horizontal_coordinate)
         self.state.base_targets = [selected]
-        self.state.status += f" | voice selected rightmost toy: {selected.label}"
+        self.state.status += (
+            f" | voice selected rightmost {active_target}: {selected.label}"
+        )
         print(
-            f"[voice] selected rightmost toy {selected.label!r}; forcing right hand",
+            f"[voice] selected rightmost {active_target} {selected.label!r}; "
+            "forcing right hand",
             flush=True,
         )
 
@@ -1481,11 +1492,11 @@ class GraspDemoApp:
             )
         )
 
-    def publish_wave(self) -> None:
+    def publish_wave(self) -> bool:
         """Queue one greeting gesture without competing with other robot work."""
         if self.robot_actions is None:
             self.state.status = "Wave unavailable: robot action service is not ready"
-            return
+            return False
         if (
             self.robot_busy()
             or is_pending(self.gripper_future)
@@ -1494,7 +1505,7 @@ class GraspDemoApp:
             or self.state.pipeline_stage is not PipelineStage.IDLE
         ):
             self.state.status = "Wave ignored: another task is running"
-            return
+            return False
         if self.ik_publisher is not None:
             self.ik_publisher.clear_stop()
         self.wave_recovery_required = False
@@ -1502,14 +1513,37 @@ class GraspDemoApp:
             self.robot_actions.publish_wave,
         )
         self.state.status = "Right-arm wave running"
+        return True
+
+    def _clear_voice_intro(self) -> None:
+        """Clear the V-key welcome synchronization gates."""
+        self.voice_intro_active = False
+        self.voice_intro_prompt_done = False
+        self.voice_intro_wave_done = False
+
+    def _finish_voice_intro_after_wave(self) -> None:
+        """Release a recorded V-key command only after the wave reaches HOME."""
+        if not bool(getattr(self, "voice_intro_active", False)):
+            return
+        prompt_done = bool(getattr(self, "voice_intro_prompt_done", False))
+        if not prompt_done:
+            self.state.status = "Wave HOME complete; waiting for welcome prompt"
+            return
+        self._clear_voice_intro()
+        if bool(getattr(self.state, "paused", False)):
+            self.state.status = "Voice recognition cancelled: application paused"
+            return
+        self.state.status = "Wave HOME complete; voice recognition active"
 
     def collect_wave_result(self) -> None:
         """Consume a completed W-key gesture on the application thread."""
         future = getattr(self, "wave_future", None)
         if future is None or not future.done():
             return
+        wave_succeeded = False
         try:
             status = future.result()
+            wave_succeeded = True
         except Exception as exc:  # noqa: BLE001
             status = f"Wave failed: {exc}"
             self.wave_recovery_required = bool(
@@ -1517,25 +1551,56 @@ class GraspDemoApp:
             )
             print(f"[wave] {status}", flush=True)
         self.wave_future = None
+        intro_active = bool(getattr(self, "voice_intro_active", False))
+        if intro_active and (not wave_succeeded or self.state.paused):
+            voice_output = getattr(self, "voice_output", None)
+            if voice_output is not None:
+                voice_output.cancel()
+            self.voice_input.cancel()
+            self.voice_recognition_attempt = 0
+            self._clear_voice_intro()
         if self.state.paused:
             self.state.status = f"Paused by S; {status}"
+        elif intro_active and wave_succeeded:
+            self.voice_intro_wave_done = True
+            self._finish_voice_intro_after_wave()
         else:
             self.state.status = status
 
     def request_voice(self) -> None:
-        """Play the welcome prompts, then start one-shot speech recognition."""
+        """Wave and play welcome prompts; open the mic after the prompts."""
         voice_output = getattr(self, "voice_output", None)
         if voice_output is None:
             # Compatibility for lightweight adapters that only provide STT.
             status = self.voice_input.request(robot_busy=self.robot_busy())
         elif not self.voice_input.enabled:
             status = None
-        elif self.robot_busy() or self.voice_input.task_active:
+        elif (
+            self.robot_busy()
+            or self.voice_input.task_active
+            or bool(getattr(self, "voice_intro_active", False))
+            or bool(getattr(voice_output, "running", False))
+        ):
             status = "Voice command ignored: robot busy"
         elif self.voice_input.recognition_running:
             status = "Voice recognition already running"
+        elif self.robot_actions is None:
+            status = "Voice command unavailable: wave service is not ready"
         else:
             status = voice_output.play_welcome()
+            if status.startswith("Voice prompt unavailable:"):
+                self.state.status = status
+                return
+            self.voice_intro_active = True
+            self.voice_intro_prompt_done = False
+            self.voice_intro_wave_done = False
+            self.voice_recognition_attempt = 1
+            if not self.publish_wave():
+                voice_output.cancel()
+                self._clear_voice_intro()
+                self.voice_recognition_attempt = 0
+                return
+            status = f"{status}; right-arm wave running"
         if status:
             self.state.status = status
 
@@ -1564,6 +1629,9 @@ class GraspDemoApp:
         if result is None:
             return
         if not result.succeeded:
+            if bool(getattr(self, "voice_intro_active", False)):
+                self._clear_voice_intro()
+            self.voice_recognition_attempt = 0
             self.state.status = f"Voice prompt failed: {result.error}"
             return
         if result.purpose == START_RECOMMENDED_GIFT:
@@ -1574,15 +1642,41 @@ class GraspDemoApp:
                 self.state.status = "Recommended gift cancelled: robot busy"
                 return
             self.voice_input.activate("white toy", handover=True)
+            self.voice_recognition_attempt = 0
             if not self.start_pipeline(grasp_on_done=True):
                 self.fail_voice_task()
+            return
+        if result.purpose == START_RETRY_RECOGNITION:
+            if bool(getattr(self.state, "paused", False)):
+                self.voice_recognition_attempt = 0
+                self.state.status = "Voice retry cancelled: application paused"
+                return
+            status = self.voice_input.request(
+                robot_busy=False,
+                record_seconds=3.0,
+            )
+            if status:
+                self.state.status = status
             return
         if result.purpose != START_RECOGNITION:
             return
         if bool(getattr(self.state, "paused", False)):
+            self._clear_voice_intro()
+            self.voice_recognition_attempt = 0
             self.state.status = "Voice recognition cancelled: application paused"
             return
-        status = self.voice_input.request(robot_busy=self.robot_busy())
+        # START_RECOGNITION is emitted only by the V-key welcome request.  A
+        # late result from a cancelled/failed intro must never open the mic.
+        if not bool(getattr(self, "voice_intro_active", False)):
+            return
+        self.voice_intro_prompt_done = True
+        # Recording does not command the robot, so the concurrent wave is not
+        # a reason to reject it.  The parsed result is held until wave HOME.
+        status = self.voice_input.request(robot_busy=False)
+        if bool(getattr(self, "voice_intro_wave_done", False)):
+            self._clear_voice_intro()
+        elif status:
+            status = f"{status}; wave returning HOME"
         if status:
             self.state.status = status
 
@@ -1591,6 +1685,8 @@ class GraspDemoApp:
         voice_output = getattr(self, "voice_output", None)
         if voice_output is not None:
             voice_output.cancel()
+        self._clear_voice_intro()
+        self.voice_recognition_attempt = 0
         self.voice_input.cancel()
         self.state.paused = True
         self.state.pipeline_stage = PipelineStage.IDLE
@@ -1603,6 +1699,13 @@ class GraspDemoApp:
 
     def collect_voice_result(self) -> None:
         """Apply one completed STT result on the application thread."""
+        if (
+            bool(getattr(self, "voice_intro_active", False))
+            and not bool(getattr(self, "voice_intro_wave_done", False))
+        ):
+            # Leave the result in VoiceGraspInput's one-item queue.  Polling it
+            # now would start SAM3 while the serialized wave still owns motion.
+            return
         parsed = self.voice_input.poll()
         if parsed is None:
             return
@@ -1610,9 +1713,26 @@ class GraspDemoApp:
         if self.state.paused:
             return
         if parsed.target is None:
+            attempt = int(getattr(self, "voice_recognition_attempt", 0))
+            voice_output = getattr(self, "voice_output", None)
+            if attempt == 1 and voice_output is not None:
+                self.voice_input.finish_task()
+                self.voice_recognition_attempt = 2
+                status = voice_output.play_repeat_question()
+                if status.startswith("Voice prompt unavailable:"):
+                    self.voice_recognition_attempt = 0
+                    status = voice_output.play_recommended_gift()
+                self.state.status = status
+                return
+            if attempt == 2 and voice_output is not None:
+                self.voice_input.finish_task()
+                self.voice_recognition_attempt = 0
+                self.state.status = voice_output.play_recommended_gift()
+                return
             self.fail_voice_task()
             return
         self.voice_input.activate(parsed.target, handover=parsed.handover)
+        self.voice_recognition_attempt = 0
         if not self.start_pipeline(grasp_on_done=True):
             self.fail_voice_task()
             return
@@ -1625,6 +1745,7 @@ class GraspDemoApp:
         voice_output = getattr(self, "voice_output", None)
         if voice_output is not None:
             voice_output.play_task_failed()
+        self.voice_recognition_attempt = 0
         self.voice_input.finish_task()
 
     def publish_tablet_state(self, bundle) -> None:
@@ -1698,6 +1819,12 @@ class GraspDemoApp:
                 return True
             self.state.paused = not self.state.paused
             if self.state.paused:
+                voice_output = getattr(self, "voice_output", None)
+                if bool(getattr(self, "voice_intro_active", False)):
+                    if voice_output is not None:
+                        voice_output.cancel()
+                    self._clear_voice_intro()
+                self.voice_recognition_attempt = 0
                 self.state.home_needs_sync.update({"left", "right"})
                 # Resume must never restart the pre-pause automatic pipeline.
                 self.state.pipeline_stage = PipelineStage.IDLE

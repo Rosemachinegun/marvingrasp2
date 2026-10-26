@@ -85,13 +85,13 @@ def test_web_and_voice_are_enabled_by_default() -> None:
 
 def test_voice_handover_phrase_is_preserved_as_active_intent() -> None:
     voice = VoiceGraspInput()
-    assert requests_handover("把钢笔递给我") is True
-    assert voice.submit_transcript("把钢笔递给我") is True
+    assert requests_handover("把笔盒递给我") is True
+    assert voice.submit_transcript("把笔盒递给我") is True
 
     parsed = voice.poll()
 
     assert parsed is not None
-    assert parsed.target == "pen"
+    assert parsed.target == "black box"
     assert parsed.handover is True
     voice.activate(parsed.target, handover=parsed.handover)
     assert voice.active_handover is True
@@ -154,17 +154,45 @@ def test_voice_toy_policy_keeps_only_rightmost_image_target() -> None:
 
     # Image horizontal position follows x/z, so white toy_2 is rightmost.
     assert app.state.base_targets == [right]
-    assert "selected rightmost toy: white toy_2" in app.state.status
+    assert "selected rightmost white toy: white toy_2" in app.state.status
+
+
+@pytest.mark.parametrize("transcript", ("把笔盒递给我", "把盒子递给我"))
+def test_chinese_box_handover_uses_black_box_prompt(transcript: str) -> None:
+    voice = VoiceGraspInput(language="zh")
+    assert voice.submit_transcript(transcript) is True
+
+    parsed = voice.poll()
+
+    assert parsed is not None
+    assert parsed.target == "black box"
+    assert parsed.handover is True
+    voice.activate(parsed.target, handover=parsed.handover)
+    assert voice.sam_prompt("white toy,black box", {}) == "black box"
+
+
+def test_voice_black_box_policy_keeps_only_rightmost_image_target() -> None:
+    left = _toy_target("black box_0", camera_x=-0.1, camera_z=0.8, base_y=-0.2)
+    right = _toy_target("black box_1", camera_x=0.3, camera_z=1.0, base_y=0.2)
+    app = GraspDemoApp.__new__(GraspDemoApp)
+    app.state = RuntimeState(base_targets=[right, left], status="FlowPose done")
+    app.voice_input = VoiceGraspInput()
+    app.voice_input.activate("black box", handover=True)
+
+    app.apply_voice_target_policy()
+
+    assert app.state.base_targets == [right]
+    assert "selected rightmost black box: black box_1" in app.state.status
 
 
 def test_every_voice_grasp_forces_right_hand() -> None:
     # A positive base Y would normally select the left hand.
-    target = _toy_target("pen_0", camera_x=0.2, camera_z=0.8, base_y=0.2)
+    target = _toy_target("black box_0", camera_x=0.2, camera_z=0.8, base_y=0.2)
     app = GraspDemoApp.__new__(GraspDemoApp)
     app.args = SimpleNamespace(ik_target_index=0, ik_hand="auto")
     app.state = RuntimeState(base_targets=[target])
     app.voice_input = VoiceGraspInput()
-    app.voice_input.activate("pen", handover=True)
+    app.voice_input.activate("black box", handover=True)
     app.robot_actions = Mock()
     app.action_executor = Mock()
     app.action_executor.submit.return_value = Future()
@@ -194,13 +222,13 @@ def test_every_voice_grasp_forces_right_hand() -> None:
 def test_english_box_phrases_request_black_box_handover(phrase: str) -> None:
     voice = VoiceGraspInput(language="en")
     assert requests_handover(phrase) is True
-    assert parse_voice_target(phrase) == "black_box"
+    assert parse_voice_target(phrase) == "black box"
     assert voice.submit_transcript(phrase) is True
 
     parsed = voice.poll()
 
     assert parsed is not None
-    assert parsed.target == "black_box"
+    assert parsed.target == "black box"
     assert parsed.handover is True
 
 

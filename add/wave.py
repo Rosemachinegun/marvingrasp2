@@ -58,10 +58,15 @@ REQUEST_IK_INPUT = 1
 MAX_START_TO_READY_DELTA_RAD = 1.50
 HOME_START_TOLERANCE_RAD = 0.08
 STATIONARY_VELOCITY_RAD_S = 0.02
-STATIONARY_DURATION_SEC = 0.40
-REPLAY_PRIME_SEC = 0.20
+STATIONARY_DURATION_SEC = 0.20
+REPLAY_PRIME_SEC = 0.08
 FINAL_HOME_TOLERANCE_RAD = 0.03
 FINAL_HOME_TIMEOUT_SEC = 4.0
+DEFAULT_MAX_VELOCITY_RAD_S = 1.00
+DEFAULT_MAX_ACCELERATION_RAD_S2 = 3.00
+WAVE_MIN_DURATION_SEC = 0.18
+HOME_TRANSITION_MIN_DURATION_SEC = 1.50
+MOVE_ENDPOINT_HOLD_SEC = 0.01
 
 
 class WaveStopped(RuntimeError):
@@ -374,14 +379,14 @@ class WaveGreeting(Node):
             if u >= 1.0:
                 break
             time.sleep(period)
-        self.hold(target, 0.05)
+        self.hold(target, MOVE_ENDPOINT_HOLD_SEC)
 
 
 def execute_wave(
     *,
     repetitions: int = 1,
-    max_velocity: float = 0.35,
-    max_acceleration: float = 0.70,
+    max_velocity: float = DEFAULT_MAX_VELOCITY_RAD_S,
+    max_acceleration: float = DEFAULT_MAX_ACCELERATION_RAD_S2,
     rate_hz: float = 100.0,
     stop_requested: Callable[[], bool] | None = None,
 ) -> str:
@@ -431,7 +436,11 @@ def execute_wave(
         safe_to_restore = True
         node.hold(current, REPLAY_PRIME_SEC)
 
-        def go(start: List[float], target: List[float], minimum: float = 0.4):
+        def go(
+            start: List[float],
+            target: List[float],
+            minimum: float = WAVE_MIN_DURATION_SEC,
+        ) -> None:
             duration = safe_duration(
                 start, target, max_velocity, max_acceleration, minimum
             )
@@ -443,24 +452,22 @@ def execute_wave(
                 go(P2_SIDE_A, P3_SIDE_B)
                 if repetition + 1 < repetitions:
                     go(P3_SIDE_B, P2_SIDE_A)
-            go(P3_SIDE_B, P1_READY)
 
         safe_to_restore = False
-        go(current, P1_READY, 2.0)
+        go(current, P1_READY, HOME_TRANSITION_MIN_DURATION_SEC)
         node.hold(P1_READY, 0)
         wave_batch()
-        node.hold(P1_READY, 0)
 
         # Return to the exact measured starting configuration, not the nominal
         # capture, then verify the hardware is settled before handing mux back.
-        go(P1_READY, current, 2.0)
+        go(P3_SIDE_B, current, HOME_TRANSITION_MIN_DURATION_SEC)
         node.hold_until_measured_target(
             current,
             tolerance=FINAL_HOME_TOLERANCE_RAD,
             timeout=FINAL_HOME_TIMEOUT_SEC,
         )
         safe_to_restore = True
-        status = f"Right-arm wave completed (batches=2 repetitions={repetitions})"
+        status = f"Right-arm wave completed (repetitions={repetitions})"
         node.get_logger().info(status)
         return status
     except (Exception, KeyboardInterrupt) as exc:
@@ -501,12 +508,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true',
                         help='actually command the real robot')
-    parser.add_argument('--repetitions', type=int, default=2,
-                        help='P2/P3 repetitions in each of the two wave batches')
-    parser.add_argument('--max-velocity', type=float, default=0.20,
-                        help='conservative joint velocity limit, rad/s')
-    parser.add_argument('--max-acceleration', type=float, default=0.50,
-                        help='conservative joint acceleration limit, rad/s^2')
+    parser.add_argument('--repetitions', type=int, default=1,
+                        help='number of P2/P3 wave repetitions')
+    parser.add_argument(
+        '--max-velocity', type=float, default=DEFAULT_MAX_VELOCITY_RAD_S,
+        help='conservative joint velocity limit, rad/s',
+    )
+    parser.add_argument(
+        '--max-acceleration', type=float,
+        default=DEFAULT_MAX_ACCELERATION_RAD_S2,
+        help='conservative joint acceleration limit, rad/s^2',
+    )
     parser.add_argument('--rate', type=float, default=100.0)
     return parser.parse_args()
 
@@ -518,8 +530,7 @@ def main() -> int:
         return 2
 
     print('Planned gesture: measured HOME -> P1 -> '
-          f'wave x{args.repetitions} -> P1 -> '
-          f'wave x{args.repetitions} -> P1 -> measured HOME')
+          f'wave x{args.repetitions} -> measured HOME')
     print('Wave endpoints around P1: '
           f'left scale={LEFT_WAVE_SCALE:.2f}, right scale={RIGHT_WAVE_SCALE:.2f}')
     print(f'Limits: velocity={args.max_velocity} rad/s, '

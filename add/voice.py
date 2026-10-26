@@ -29,12 +29,12 @@ VOICE_AUTO_GAIN = float(os.getenv("VOICE_AUTO_GAIN", "8.0"))
 VOICE_LANGUAGE = os.getenv("VOICE_LANGUAGE", "zh")
 VOICE_HOTWORDS = {
     "en": (
-        "Marvin give me pick up grab hand me pencil case pencil box "
-        "box black box screwdriver handle pen toy"
+        "Marvin give me pick up grab hand me white toy pencil case "
+        "pencil box box black box"
     ),
     "zh": (
-        "Marvin 机械臂 抓取 夹取 我想要 递给我 给我推荐一个 推荐 笔 钢笔 螺丝刀 把手 "
-        "玩具 蓝色方块 黄色方块 方块 U盘 硬盘"
+        "Marvin 机械臂 抓取 夹取 我想要 递给我 给我推荐一个 推荐 "
+        "玩具 白色玩具 笔盒 盒子 黑盒 黑色盒子"
     ),
 }
 
@@ -259,24 +259,15 @@ def parse_voice_target(text: str) -> str | None:
     if recommendation:
         return "white toy"
 
-    # Check box phrases before "pen": "pencil case" contains "pen".
-    if any(name in command for name in ("pencilcase", "pencilbox", "blackbox", "box")):
-        return "black_box"
-    if "螺丝刀" in command or "改锥" in command:
-        return "screwdriver_handle"
-    if "screwdriver" in command:
-        return "screwdriver_handle"
-    if ("蓝色" in command or "蓝" in command) and any(
-        word in command for word in ("方块", "积木", "立方体")
+    if any(
+        name in command
+        for name in (
+            "笔盒", "盒子", "黑盒", "黑色盒子",
+            "pencilcase", "pencilbox", "blackbox", "box",
+        )
     ):
-        return "blue_cube"
-    if ("黄色" in command or "黄" in command) and any(
-        word in command for word in ("方块", "积木", "立方体")
-    ):
-        return "yellow_cube"
-    if "笔" in command or any(name in command for name in ("pen", "pencil")):
-        return "pen"
-    if "玩具" in command or "whitetoy" in command:
+        return "black box"
+    if "玩具" in command or "toy" in command:
         return "white toy"
     return None
 
@@ -289,13 +280,6 @@ def sam_prompt_for_target(
     """Return prompts whose resulting labels can reuse existing YAML policies."""
     if target is None:
         return default_prompts
-    if target == "screwdriver_handle":
-        variants = sorted(
-            name for name in (pick_templates or {})
-            if name == target or name.endswith("_screwdriver_handle")
-        )
-        if variants:
-            return ",".join(variants)
     return target
 
 
@@ -334,7 +318,12 @@ class VoiceGraspInput:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def request(self, *, robot_busy: bool) -> str | None:
+    def request(
+        self,
+        *,
+        robot_busy: bool,
+        record_seconds: float | None = None,
+    ) -> str | None:
         """Start one background recording; return the UI status to display."""
         if not self.enabled:
             return None
@@ -343,14 +332,20 @@ class VoiceGraspInput:
         if self.recognition_running or not self._queue.empty():
             return "Voice recognition already running"
 
+        duration = (
+            self.record_seconds
+            if record_seconds is None
+            else max(0.1, float(record_seconds))
+        )
         self._cancelled.clear()
         self._thread = Thread(
             target=self._recognize_once,
+            args=(duration,),
             name="voice-stt",
             daemon=True,
         )
         self._thread.start()
-        return f"Voice recognition starting ({self.record_seconds:g} s recording)"
+        return f"Voice recognition starting ({duration:g} s recording)"
 
     def _build_recognizer(self) -> SpeechRecognizer:
         if self._recognizer_factory is not None:
@@ -366,8 +361,9 @@ class VoiceGraspInput:
                 switch(self.language)
         return self.language
 
-    def _recognize_once(self) -> None:
+    def _recognize_once(self, duration: float | None = None) -> None:
         """Run only microphone/STT work and enqueue its text result."""
+        duration = self.record_seconds if duration is None else float(duration)
         try:
             if self._recognizer is None:
                 self._recognizer = self._build_recognizer()
@@ -380,7 +376,7 @@ class VoiceGraspInput:
         if self._stop.is_set() or self._cancelled.is_set():
             return
         try:
-            result = self._recognizer.listen_once(duration=self.record_seconds)
+            result = self._recognizer.listen_once(duration=duration)
         except Exception as exc:  # noqa: BLE001
             print(f"[voice] recognition failed: {exc}", flush=True)
             if not self._stop.is_set() and not self._cancelled.is_set():
